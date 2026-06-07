@@ -1,0 +1,267 @@
+diff --git a/geminiLiveBase.js b/geminiLiveBase.js
+index dec5d72..db2a030 100644
+--- a/geminiLiveBase.js
++++ b/geminiLiveBase.js
+@@ -239,15 +239,25 @@ const SILENCE_TIMEOUT_MS  = Number(process.env.SILENCE_TIMEOUT_MS    || 30 * 100
+  * @param {Object|null} business     Pre-resolved business config (optional — router passes it)
+  * @param {Object}     vertical      { buildPrompt(business, dates), tools[], onToolCall(fc, session) → { response, booking } }
+  * @param {Object}     [opts]
+- * @param {Object}     [opts.prewarmEntry]  Pre-warmed Gemini Live session from
+- *                                          warmSessionRegistry. If provided AND
+- *                                          .gemini is open, skip the cold connect
+- *                                          and attach to the existing session.
+- *                                          See warmSessionRegistry.js.
++ * @param {Object}     [opts.prewarmEntry]      LEGACY (pre-2026-06-07): a fully-
++ *                                              attached warm entry from
++ *                                              warmSessionRegistry. Kept for
++ *                                              backward compat. New callers
++ *                                              should use prewarmSessionId.
++ * @param {string|null}[opts.prewarmSessionId]  NEW (2026-06-07 ChatGPT QA fix):
++ *                                              the sessionId of a warm entry
++ *                                              that has NOT YET been attached.
++ *                                              ensureGeminiConnected will claim
++ *                                              it lazily, AFTER Vobiz event:start
++ *                                              fires (spans.mediaUpAt set).
++ *                                              Eliminates the prewarm-attach
++ *                                              race that closed Vobiz WS in 1-4ms.
+  */
+ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opts = {}) {
+   const { buildPrompt, tools, onToolCall } = vertical;
+-  const prewarmEntry = opts.prewarmEntry || null;
++  // prewarmEntry is now `let` so claimWarmSessionAfterStart() can set it.
++  let prewarmEntry        = opts.prewarmEntry || null;
++  const prewarmSessionId  = opts.prewarmSessionId || null;
+ 
+   // Resolve business if not pre-loaded
+   if (!business) {
+@@ -439,10 +449,53 @@ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opt
+   // cleanly, and Gemini stays silent. This helper guarantees ONE session
+   // regardless of how many callers ask for it — late callers await the same
+   // in-flight Promise.
++  // ── Lazy warm-session claim (2026-06-07 ChatGPT QA fix) ────────────────
++  // Called only after spans.mediaUpAt is set (event:start fired). Attaches
++  // the warm entry by sessionId, marks prewarmEntry so the next call to
++  // ensureGeminiConnected takes the PREWARM ATTACH branch below.
++  function claimWarmSessionAfterStart() {
++    if (prewarmEntry) return prewarmEntry;
++    if (!prewarmSessionId) return null;
++    const warmRegistry = require('./warmSessionRegistry');
++    const entry = warmRegistry.attach(prewarmSessionId);
++    if (entry && entry.gemini && !entry.geminiClosedPreAttach) {
++      prewarmEntry = entry;
++      const setupAge = entry.setupCompleteAt
++        ? `${Date.now() - entry.setupCompleteAt}ms after setupComplete`
++        : 'setupComplete NOT YET';
++      console.log(`[Live:${vertical.name}] ${callId} — PREWARM CLAIMED AFTER START sessionId=${prewarmSessionId} (${setupAge})`);
++      return entry;
++    }
++    if (entry) {
++      console.warn(`[Live:${vertical.name}] ${callId} — PREWARM ENTRY DEAD sessionId=${prewarmSessionId} (geminiClosedPreAttach=${!!entry.geminiClosedPreAttach}) — cold connect`);
++      try { entry.gemini?.close?.(); } catch (_) {}
++    } else {
++      console.log(`[Live:${vertical.name}] ${callId} — no warm entry for sessionId=${prewarmSessionId} — cold connect`);
++    }
++    return null;
++  }
++
+   function ensureGeminiConnected() {
+     if (geminiWs)              return Promise.resolve(geminiWs);
+     if (geminiConnectPromise)  return geminiConnectPromise;
+ 
++    // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++    // If the caller passed a prewarmSessionId (NEW path) but Vobiz has not
++    // yet sent event:start (spans.mediaUpAt unset), DEFER. Attaching during
++    // the pre-event:start window races with Vobiz's stream handshake and
++    // gets the WS torn down in 1-4ms. The event:start handler in the
++    // Vobiz event loop calls ensureGeminiConnected() AGAIN after stamping
++    // mediaUpAt — that's when we actually attach.
++    if (prewarmSessionId && !prewarmEntry && !spans.mediaUpAt) {
++      console.log(`[Live:${vertical.name}] ${callId} — ensureGeminiConnected DEFERRED (prewarm sessionId=${prewarmSessionId}, awaiting Vobiz event:start)`);
++      return Promise.resolve(null);
++    }
++
++    // Lazily claim warm session — only safe after event:start armed mediaUpAt.
++    if (prewarmSessionId && !prewarmEntry && spans.mediaUpAt) {
++      claimWarmSessionAfterStart();
++    }
++
+     // ── PREWARM ATTACH PATH (Sub-1s Voice Bridge, gated on LIVE_PREWARM) ──
+     // If the dial path opened a Gemini Live session during the ringing
+     // window, claim it here instead of opening a cold one. The warm entry
+@@ -1015,6 +1068,12 @@ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opt
+                                        ? (session.startTime - prewarmEntry.setupCompleteAt)
+                                        : null,
+           prewarmUnheardAudioBytes:  prewarmEntry ? prewarmEntry.unheardAudioBytes : null,
++          // 2026-06-07 (ChatGPT QA — defer-warm-attach fix) telemetry.
++          // prewarmSessionId   = sessionId we were holding (deferred attach mode)
++          // prewarmClaimedAfterStart = true if claimWarmSessionAfterStart() succeeded
++          prewarmSessionId:          prewarmSessionId,
++          prewarmDeferralMode:       !!prewarmSessionId,
++          prewarmClaimedAfterStart:  !!prewarmSessionId && !!prewarmEntry,
+           anomalies:                 anomalyCounts,
+           // Per-turn caller-stop → bot-first-audio (2026-06-04 monitor agent).
+           // Distinct from pickupToFirstAudioMs (greeting only). Capped at 20
+@@ -1087,13 +1146,20 @@ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opt
+         if (msg.start?.streamId) session.streamId = msg.start.streamId;
+         session.callerPhone = msg.start?.from || msg.start?.caller || msg.start?.ani || msg.from || session.callerPhone || null;
+         spans.mediaUpAt = Date.now();
+-        console.log(`[Live:${vertical.name}] ${callId} start — caller=${session.callerPhone}, streamId=${session.streamId} (mediaUp)`);
++        console.log(`[Live:${vertical.name}] ${callId} start — caller=${session.callerPhone}, streamId=${session.streamId} (mediaUp) prewarmSession=${prewarmSessionId || '(none)'}`);
+         // 2026-06-08 (ChatGPT review): arm the kickoff fallback timer at
+         // media-up, NOT at setupComplete. This bounds dead-air to
+         // KICKOFF_FALLBACK_MS regardless of how long Gemini takes to come up.
+         armKickoffFallbackTimer();
+-        // Whether the early-connect IIFE already opened the session or not,
+-        // ensureGeminiConnected() returns the same in-flight Promise.
++        // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++        // event:start is the green light to attach the warm session. The
++        // ensureGeminiConnected() call below will now take the lazy-claim
++        // path inside the function: it sees spans.mediaUpAt is set, runs
++        // claimWarmSessionAfterStart(), and then the PREWARM ATTACH branch
++        // installs the listener + replays the buffered setupComplete.
++        //
++        // For cold path (no prewarmSessionId), this is the same code path
++        // as before: ensureGeminiConnected awaits the early-connect Promise.
+         await ensureGeminiConnected().catch((err) =>
+           console.error(`[Live:${vertical.name}] ${callId} — start connect failed: ${err.message}`)
+         );
+@@ -1140,7 +1206,20 @@ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opt
+     }
+   });
+ 
+-  ws.on('close', () => endCallOnce('caller_hangup').catch(() => {}));
++  ws.on('close', (code, reason) => {
++    // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++    // If WS closed BEFORE Vobiz event:start (spans.mediaUpAt unset), and
++    // we were holding a deferred warm sessionId, release it back to the
++    // registry's cancel path so the underlying Gemini socket gets closed.
++    if (prewarmSessionId && !prewarmEntry && !spans.mediaUpAt) {
++      try {
++        require('./warmSessionRegistry').cancel(prewarmSessionId, 'ws_closed_before_start');
++      } catch (_) {}
++    }
++    const reasonStr = (reason && typeof reason.toString === 'function') ? reason.toString() : '';
++    console.warn(`[Live:${vertical.name}] ${callId} Vobiz WS close code=${code} reason="${reasonStr}" sawStart=${!!spans.mediaUpAt} prewarmDeferred=${!!prewarmSessionId && !prewarmEntry}`);
++    endCallOnce('caller_hangup').catch(() => {});
++  });
+   ws.on('error', (err) => console.error(`[Live:${vertical.name}] ${callId} Vobiz error: ${err.message}`));
+ 
+   // Auto-timeout
+@@ -1153,9 +1232,19 @@ async function runLiveCall(ws, callId, callerPhone, did, business, vertical, opt
+   // — if the early-connect is still in flight, it waits on the SAME Promise
+   // (no second session is opened). If the early-connect already finished,
+   // the start handler returns immediately and audio starts flowing.
+-  ensureGeminiConnected().catch((err) =>
+-    console.error(`[Live:${vertical.name}] ${callId} — early connect failed: ${err.message}`)
+-  );
++  //
++  // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++  // SKIP early-connect when a deferred warm session is present. The whole
++  // point of the deferral is to wait for event:start before doing anything
++  // Gemini-side. ensureGeminiConnected will short-circuit if invoked
++  // pre-event:start, but better to not invoke it at all.
++  if (!prewarmSessionId && !prewarmEntry) {
++    ensureGeminiConnected().catch((err) =>
++      console.error(`[Live:${vertical.name}] ${callId} — early connect failed: ${err.message}`)
++    );
++  } else {
++    console.log(`[Live:${vertical.name}] ${callId} — early connect SKIPPED (prewarm path: sessionId=${prewarmSessionId || '(none)'}, entry=${!!prewarmEntry})`);
++  }
+ 
+   // 3s belt-and-braces: in case neither early-connect nor `start` triggered
+   // a successful connect (e.g. transient SDK error), retry from a clean slate.
+diff --git a/index-outbound.js b/index-outbound.js
+index dd97202..030046c 100644
+--- a/index-outbound.js
++++ b/index-outbound.js
+@@ -716,25 +716,29 @@ wssOutboundFast.on('connection', (ws, req) => {
+ 
+   const business = { ...ctx.business, _outboundCustomer: ctx.customer };
+ 
+-  // 2026-06-08 (ChatGPT review P0 #3): attach pre-warmed Gemini session if any.
+-  let prewarmEntry = null;
+-  if (sessionId) {
+-    const entry = warmRegistry.attach(sessionId);
+-    if (entry && entry.gemini && !entry.geminiClosedPreAttach) {
+-      prewarmEntry = entry;
+-      const setupAge = entry.setupCompleteAt ? `${Date.now() - entry.setupCompleteAt}ms after setupComplete` : 'setupComplete NOT YET';
+-      console.log(`[VaniOutFast] PREWARM HIT sessionId=${sessionId} (${setupAge})`);
+-    } else if (entry) {
+-      console.warn(`[VaniOutFast] PREWARM ENTRY DEAD sessionId=${sessionId} — cold connect`);
+-      try { entry.gemini?.close?.(); } catch (_) {}
+-    } else {
+-      console.log(`[VaniOutFast] no warm entry for sessionId=${sessionId} — cold connect`);
+-    }
++  // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++  //
++  // DO NOT call warmRegistry.attach(sessionId) here. Vobiz has connected the
++  // WS but has NOT yet sent event:start. Attaching the warm Gemini session
++  // synchronously replays the buffered setupComplete through onGeminiMessage
++  // BEFORE Vobiz's stream handshake is complete. This makes Vobiz tear the
++  // WS down within 1-4ms (observed 2026-06-07: prewarmHit=true →
++  // duration_ms=1-4ms, zero audio in either direction, end_reason=
++  // caller_hangup; prewarmHit=false → 25-36s healthy call). Cold path
++  // accidentally works because Gemini's handshake delay defers the same
++  // internal state transition until after Vobiz is ready.
++  //
++  // Fix: pass the sessionId through to runLiveCall; geminiLiveBase will
++  // claim the warm entry lazily, from the event:start handler, once
++  // spans.mediaUpAt is set.
++  const prewarmSessionId = sessionId || null;
++  if (prewarmSessionId) {
++    console.log(`[VaniOutFast] PREWARM DEFERRED sessionId=${prewarmSessionId} — will claim after Vobiz event:start`);
+   }
+ 
+-  console.log(`[VaniOutFast] WS connected ctx=${ctxId} callId=${callId} sessionId=${sessionId || '(none)'} customer=${ctx.customer.phone} prewarm=${!!prewarmEntry}`);
++  console.log(`[VaniOutFast] WS connected ctx=${ctxId} callId=${callId} sessionId=${sessionId || '(none)'} customer=${ctx.customer.phone} prewarm_session=${!!prewarmSessionId}`);
+ 
+-  handleOutboundCallFast(ws, callId, ctx.customer.phone, business.id, business, { prewarmEntry })
++  handleOutboundCallFast(ws, callId, ctx.customer.phone, business.id, business, { prewarmSessionId })
+     .catch((err) => {
+       console.error(`[VaniOutFast] outbound-fast agent threw: ${err.message}`);
+       try { ws.close(1011, 'agent_error'); } catch (_) {}
+@@ -772,35 +776,18 @@ wssOutbound.on('connection', (ws, req) => {
+   // Inject customer onto a copy of the business object so buildPrompt can read it.
+   const business = { ...ctx.business, _outboundCustomer: ctx.customer };
+ 
+-  // ── Sub-1s Voice Bridge: claim pre-warmed Gemini session, if any ─────────
+-  // Guard-rail #4: attach() can return null (miss) OR an entry whose
+-  // setupComplete is still false (warm fired but Gemini wasn't ready
+-  // before pickup). In both cases we MUST fall back to the cold connect
+-  // path inside runLiveCall, which is what passing prewarmEntry=null does.
+-  let prewarmEntry = null;
+-  if (sessionId) {
+-    const entry = warmRegistry.attach(sessionId);
+-    if (entry && entry.gemini && !entry.geminiClosedPreAttach) {
+-      // Warm hit with a live socket. Pass through to runLiveCall — it
+-      // will install its listener and replay the buffer.
+-      prewarmEntry = entry;
+-      const setupAge = entry.setupCompleteAt
+-        ? `${Date.now() - entry.setupCompleteAt}ms after setupComplete`
+-        : 'setupComplete NOT YET (will replay on arrival)';
+-      console.log(`[VaniOut] WS bridge — PREWARM HIT sessionId=${sessionId} (${setupAge})`);
+-    } else if (entry) {
+-      // Got the entry but it's unusable (connect failed or socket closed).
+-      // Cold fallback. The entry is already out of the registry so no leak.
+-      console.warn(`[VaniOut] WS bridge — PREWARM ENTRY DEAD sessionId=${sessionId} (geminiClosedPreAttach=${!!entry.geminiClosedPreAttach}) — using cold connect`);
+-      try { entry.gemini?.close?.(); } catch (_) {}
+-    } else {
+-      console.log(`[VaniOut] WS bridge — no warm entry for sessionId=${sessionId} — cold connect`);
+-    }
++  // 2026-06-07 (ChatGPT QA — defer-warm-attach fix):
++  //
++  // Same race as /call/outbound-fast above. Pass sessionId through; let
++  // geminiLiveBase claim lazily from event:start handler. Do NOT attach here.
++  const prewarmSessionId = sessionId || null;
++  if (prewarmSessionId) {
++    console.log(`[VaniOut] WS bridge — PREWARM DEFERRED sessionId=${prewarmSessionId} — will claim after Vobiz event:start`);
+   }
+ 
+-  console.log(`[VaniOut] WS connected ctx=${ctxId} callId=${callId} sessionId=${sessionId || '(none)'} customer=${ctx.customer.phone} vehicle=${ctx.customer.vehicle_model} prewarm=${!!prewarmEntry}`);
++  console.log(`[VaniOut] WS connected ctx=${ctxId} callId=${callId} sessionId=${sessionId || '(none)'} customer=${ctx.customer.phone} vehicle=${ctx.customer.vehicle_model} prewarm_session=${!!prewarmSessionId}`);
+ 
+-  handleOutboundCall(ws, callId, ctx.customer.phone, business.id, business, { prewarmEntry })
++  handleOutboundCall(ws, callId, ctx.customer.phone, business.id, business, { prewarmSessionId })
+     .catch((err) => {
+       console.error(`[VaniOut] outbound agent threw: ${err.message}`);
+       try { ws.close(1011, 'agent_error'); } catch (_) {}
