@@ -1,0 +1,85 @@
+diff --git a/index-outbound.js b/index-outbound.js
+index 030046c..711a881 100644
+--- a/index-outbound.js
++++ b/index-outbound.js
+@@ -689,8 +689,23 @@ app.post('/vobiz/xml-outbound-fast', (req, res) => {
+ // ─── HTTP server + outbound WSS ───────────────────────────────────────────────
+ const server = http.createServer(app);
+ 
+-// Outbound-fast WSS — caller-first kickoff mode (Adukkala pattern)
+-const wssOutboundFast = new WebSocketServer({ server, path: '/call/outbound-fast' });
++// 2026-06-08 P0 ROOT CAUSE FIX (HangupCauseCode 4010 / WS upgrade returning HTTP 400):
++//
++// Each `new WebSocketServer({ server, path })` installs its OWN listener on
++// `server.on('upgrade')`. When TWO WSS instances share one http server, the
++// first listener fires for EVERY upgrade — and if the path doesn't match its
++// own, it calls `abortHandshake(socket, 400)` which writes "HTTP/1.1 400 Bad
++// Request" and destroys the socket BEFORE the second WSS listener gets to
++// run. Result: 100% of Vobiz outbound calls die at TCP level in 1-5ms.
++//
++// Canonical fix from ws library docs: instantiate each WSS with
++// `noServer: true` (skips the auto-attached listener) and add ONE
++// `server.on('upgrade')` router that dispatches to the right WSS by
++// pathname. The duplicated routing logic stays in one place.
++//
++// Verified via Vobiz CDR (HangupCauseCode 4010 = "End Of XML Instructions"
++// source=Vobiz) + Railway HTTP logs (GET /call/outbound → 400, no app log).
++const wssOutboundFast = new WebSocketServer({ noServer: true });
+ wssOutboundFast.on('connection', (ws, req) => {
+   let ctxId = null;
+   let callId = null;
+@@ -745,10 +760,9 @@ wssOutboundFast.on('connection', (ws, req) => {
+     });
+ });
+ 
+-// Outbound WSS — this is the ONLY WSS this service mounts. Inbound /call WSS
+-// lives in index.js. Vobiz will only ever upgrade to /call/outbound when the
+-// answer_url points at THIS service's host.
+-const wssOutbound = new WebSocketServer({ server, path: '/call/outbound' });
++// Outbound WSS — same noServer:true pattern as wssOutboundFast above.
++// Inbound /call WSS lives in index.js (different Railway service).
++const wssOutbound = new WebSocketServer({ noServer: true });
+ wssOutbound.on('connection', (ws, req) => {
+   let ctxId = null;
+   let callId = null;
+@@ -794,6 +808,35 @@ wssOutbound.on('connection', (ws, req) => {
+     });
+ });
+ 
++// ─── Single upgrade router (2026-06-08 P0 FIX) ───────────────────────────────
++// Replaces the per-WSS auto-installed listeners that were aborting each other
++// with HTTP 400. We listen to `upgrade` ONCE here, parse the path, and
++// dispatch to the matching WSS via handleUpgrade. Any unknown path is
++// destroyed without writing 400 back (so Vobiz sees a TCP RST it understands,
++// not a malformed HTTP response).
++server.on('upgrade', (req, socket, head) => {
++  let pathname;
++  try {
++    pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
++  } catch (_) {
++    socket.destroy();
++    return;
++  }
++
++  if (pathname === '/call/outbound-fast') {
++    wssOutboundFast.handleUpgrade(req, socket, head, (ws) => {
++      wssOutboundFast.emit('connection', ws, req);
++    });
++  } else if (pathname === '/call/outbound') {
++    wssOutbound.handleUpgrade(req, socket, head, (ws) => {
++      wssOutbound.emit('connection', ws, req);
++    });
++  } else {
++    console.warn(`[VaniOut] upgrade for unknown path=${pathname} — destroying socket`);
++    socket.destroy();
++  }
++});
++
+ server.listen(PORT, () => {
+   console.log(`[VaniOut] OUTBOUND server running on port ${PORT}`);
+   console.log(`[VaniOut] Supabase: ${process.env.SUPABASE_URL ? 'connected' : '(not set)'}`);
+@@ -805,3 +848,4 @@ process.on('SIGTERM', () => {
+   console.log('[VaniOut] SIGTERM received — shutting down gracefully');
+   server.close(() => process.exit(0));
+ });
++
