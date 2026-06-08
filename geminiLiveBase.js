@@ -1288,13 +1288,27 @@ async function buildLiveConnectConfig(business, vertical) {
 
   const SILENCE_MS    = Number(process.env.LIVE_SILENCE_MS    || 600);
   const PREFIX_PAD_MS = Number(process.env.LIVE_PREFIX_PAD_MS || 100);
+  // 2026-06-08 (ChatGPT QA Stage B1):
+  // Mirror the cold-path connectGemini() VAD env reads here so that warm-
+  // session calls (the prewarm path) also pick up LIVE_END_SENS /
+  // LIVE_START_SENS overrides. Without this, warm-attached outbound calls
+  // were ignoring sensitivity env vars and paying the full ~1.0-1.6s per-
+  // turn lag observed in call 5926a3e1 (perTurnReplyMs=[1580,1202,1017]),
+  // while the inbound vani-server service (cold-path only) was already
+  // benefitting from END_SENSITIVITY_HIGH.
+  //
+  // Behavior preserved when env vars unset: payload bytes identical to
+  // pre-patch (no default sensitivity field added to AAD).
+  const END_SENS      = process.env.LIVE_END_SENS   || null;  // unset = SDK default
+  const START_SENS    = process.env.LIVE_START_SENS || null;  // unset = SDK default
+  const aad = {
+    silenceDurationMs: SILENCE_MS,
+    prefixPaddingMs:   PREFIX_PAD_MS,
+  };
+  if (END_SENS)   aad.endOfSpeechSensitivity   = END_SENS;
+  if (START_SENS) aad.startOfSpeechSensitivity = START_SENS;
   const vadConfig = process.env.LIVE_VAD_DISABLED === 'true' ? {} : {
-    realtimeInputConfig: {
-      automaticActivityDetection: {
-        silenceDurationMs: SILENCE_MS,
-        prefixPaddingMs:   PREFIX_PAD_MS,
-      },
-    },
+    realtimeInputConfig: { automaticActivityDetection: aad },
   };
 
   return {
